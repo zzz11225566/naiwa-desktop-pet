@@ -1,0 +1,6 @@
+/build/
+/release/*
+!/release/奶蛙.exe
+!/release/奶蛙.ico
+*.log
+*.tmp
