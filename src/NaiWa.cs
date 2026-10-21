@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
@@ -136,9 +138,37 @@ public class PetWindow : Window
     private readonly Image _idleImage;
     private readonly Image _actionImage;
     private readonly ScaleTransform _idleScale;
-    private readonly ScaleTransform _actionScale;
-    private readonly BitmapImage _idleBitmap;
-    private readonly List<BitmapImage> _actionBitmaps = new List<BitmapImage>();
+    private readonly BitmapImage[] _idleBitmaps = new BitmapImage[3];
+    private readonly MeshAnimator _animator;
+    private readonly WriteableBitmap _meshBitmap;
+    private readonly byte[] _meshBuffer;
+    private readonly int _meshSize = 512;
+
+    private readonly Joint[] _restJoints =
+    {
+        new Joint(0.50, 0.80),
+        new Joint(0.50, 0.55),
+        new Joint(0.50, 0.28),
+        new Joint(0.34, 0.56),
+        new Joint(0.20, 0.64),
+        new Joint(0.12, 0.74),
+        new Joint(0.66, 0.56),
+        new Joint(0.80, 0.64),
+        new Joint(0.88, 0.74),
+        new Joint(0.42, 0.84),
+        new Joint(0.36, 0.94),
+        new Joint(0.32, 1.02),
+        new Joint(0.58, 0.84),
+        new Joint(0.64, 0.94),
+        new Joint(0.68, 1.02)
+    };
+
+    private double[] _currentJoints;
+    private string _actionName;
+    private DateTime _actionStart;
+    private double _actionDuration;
+    private bool _actionActive;
+    private bool _rendering;
 
     private DateTime _downTime;
     private Point _downPoint;
@@ -146,40 +176,49 @@ public class PetWindow : Window
     private bool _mouseDown;
     private bool _dragging;
     private bool _suppressAction;
-    private bool _actionActive;
     private DispatcherTimer _clickTimer;
-    private DispatcherTimer _returnTimer;
     private PanelWindow _panel;
 
-    private static readonly string IdleResource = "NaiWa.idle.png";
-    private static readonly string[] ActionResources =
-    {
-        "NaiWa.action.0.png",
-        "NaiWa.action.1.png",
-        "NaiWa.action.2.png",
-        "NaiWa.action.3.png",
-        "NaiWa.action.4.png",
-        "NaiWa.action.5.png",
-        "NaiWa.action.6.png",
-        "NaiWa.action.7.png"
-    };
+    private static readonly string[] IdleResources = { "NaiWa.front.png", "NaiWa.side.png", "NaiWa.back.png" };
+    private static readonly string[] ActionNames = { "fly", "wave", "run", "test", "dance", "squat" };
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint flags);
+
+    private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_SHOWWINDOW = 0x0040;
 
     public PetWindow()
     {
         _settings = PetSettings.Load();
-        _idleBitmap = LoadPng(IdleResource);
-        foreach (string name in ActionResources)
+        for (int i = 0; i < IdleResources.Length; i++)
         {
-            BitmapImage bmp = LoadPng(name);
-            if (bmp != null) _actionBitmaps.Add(bmp);
+            _idleBitmaps[i] = LoadPng(IdleResources[i]);
         }
 
-        _idleScale = new ScaleTransform(1, 1);
-        _actionScale = new ScaleTransform(1, 1);
+        BitmapImage frontBitmap = _idleBitmaps[0] ?? LoadPng(IdleResources[0]);
+        using (System.Drawing.Bitmap front = BitmapFromBitmapImage(frontBitmap))
+        {
+            _animator = new MeshAnimator(front, _restJoints, 512);
+        }
 
+        _currentJoints = new double[_restJoints.Length * 2];
+        for (int i = 0; i < _restJoints.Length; i++)
+        {
+            _currentJoints[i * 2] = _restJoints[i].U;
+            _currentJoints[i * 2 + 1] = _restJoints[i].V;
+        }
+
+        _meshBitmap = new WriteableBitmap(_meshSize, _meshSize, 96, 96, PixelFormats.Pbgra32, null);
+        _meshBuffer = new byte[_meshSize * _meshSize * 4];
+
+        _idleScale = new ScaleTransform(1, 1);
         _idleImage = new Image
         {
-            Source = _idleBitmap,
+            Source = _idleBitmaps[_rng.Next(3)],
             Stretch = Stretch.Uniform,
             RenderTransformOrigin = new Point(0.5, 1),
             RenderTransform = _idleScale,
@@ -187,9 +226,8 @@ public class PetWindow : Window
         };
         _actionImage = new Image
         {
+            Source = _meshBitmap,
             Stretch = Stretch.Uniform,
-            RenderTransformOrigin = new Point(0.5, 1),
-            RenderTransform = _actionScale,
             IsHitTestVisible = false,
             Opacity = 0
         };
@@ -213,8 +251,8 @@ public class PetWindow : Window
         MouseLeftButtonUp += OnMouseLeftUp;
         MouseMove += OnMouseMove;
         MouseRightButtonUp += OnRightClick;
-        Closing += OnClosing;
         Loaded += OnLoaded;
+        Closing += OnClosing;
 
         ApplySize(_settings.Scale * BaseSize);
     }
@@ -232,6 +270,7 @@ public class PetWindow : Window
         Left = Clamp(x, work.Left, work.Right - Width);
         Top = Clamp(y, work.Top, work.Bottom - Height);
         StartIdleBreathing();
+        ApplyLayer(_settings.Topmost);
     }
 
     private void StartIdleBreathing()
@@ -326,55 +365,149 @@ public class PetWindow : Window
 
     private void TriggerAction()
     {
-        if (_actionActive || _actionBitmaps.Count == 0) return;
+        if (_actionActive) return;
         _actionActive = true;
+        _actionName = ActionNames[_rng.Next(ActionNames.Length)];
+        _actionStart = DateTime.UtcNow;
+        _actionDuration = 3.2 + _rng.NextDouble() * 1.6;
 
-        BitmapImage frame = _actionBitmaps[_rng.Next(_actionBitmaps.Count)];
-        _actionImage.Source = frame;
-        _actionImage.Opacity = 0;
-        _actionScale.ScaleX = 0.94;
-        _actionScale.ScaleY = 0.94;
-
-        var inEase = new CubicEase { EasingMode = EasingMode.EaseOut };
-        _idleImage.BeginAnimation(OpacityProperty, new DoubleAnimation(1.0, 0.0, TimeSpan.FromSeconds(0.30))
+        _idleImage.BeginAnimation(OpacityProperty, new DoubleAnimation(1.0, 0.0, TimeSpan.FromSeconds(0.28))
         {
-            EasingFunction = inEase
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
         });
-        _actionImage.BeginAnimation(OpacityProperty, new DoubleAnimation(0.0, 1.0, TimeSpan.FromSeconds(0.30))
+        _actionImage.BeginAnimation(OpacityProperty, new DoubleAnimation(0.0, 1.0, TimeSpan.FromSeconds(0.28))
         {
-            EasingFunction = inEase
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
         });
-        _actionScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.94, 1.0, TimeSpan.FromSeconds(0.34))
+        if (!_rendering)
         {
-            EasingFunction = new BackEase { Amplitude = 0.22, EasingMode = EasingMode.EaseOut }
-        });
-        _actionScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.94, 1.0, TimeSpan.FromSeconds(0.34))
-        {
-            EasingFunction = new BackEase { Amplitude = 0.22, EasingMode = EasingMode.EaseOut }
-        });
-
-        double hold = 2.5 + _rng.NextDouble() * 1.8;
-        _returnTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(0.30 + hold) };
-        _returnTimer.Tick += delegate
-        {
-            _returnTimer.Stop();
-            ReturnToIdle();
-        };
-        _returnTimer.Start();
+            _rendering = true;
+            CompositionTarget.Rendering += OnRendering;
+        }
     }
 
-    private void ReturnToIdle()
+    private void OnRendering(object sender, EventArgs e)
     {
-        var outEase = new CubicEase { EasingMode = EasingMode.EaseInOut };
-        _idleImage.BeginAnimation(OpacityProperty, new DoubleAnimation(0.0, 1.0, TimeSpan.FromSeconds(0.46))
+        double elapsed = (DateTime.UtcNow - _actionStart).TotalSeconds;
+        Joint[] targetJoints;
+        if (_actionActive && elapsed < _actionDuration)
         {
-            EasingFunction = outEase
-        });
-        _actionImage.BeginAnimation(OpacityProperty, new DoubleAnimation(1.0, 0.0, TimeSpan.FromSeconds(0.46))
+            targetJoints = ActionPose(_actionName, elapsed);
+        }
+        else
         {
-            EasingFunction = outEase
-        });
-        _actionActive = false;
+            targetJoints = _restJoints;
+            if (_actionActive)
+            {
+                _actionActive = false;
+                _rendering = false;
+                CompositionTarget.Rendering -= OnRendering;
+                _idleImage.Source = _idleBitmaps[_rng.Next(3)];
+                _idleImage.BeginAnimation(OpacityProperty, new DoubleAnimation(0.0, 1.0, TimeSpan.FromSeconds(0.46))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
+                });
+                _actionImage.BeginAnimation(OpacityProperty, new DoubleAnimation(1.0, 0.0, TimeSpan.FromSeconds(0.46))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseInOut }
+                });
+            }
+        }
+
+        double[] targetFlat = FlattenJoints(targetJoints);
+        for (int i = 0; i < _currentJoints.Length; i++)
+        {
+            _currentJoints[i] += (targetFlat[i] - _currentJoints[i]) * 0.24;
+        }
+
+        Joint[] joints = new Joint[_restJoints.Length];
+        for (int i = 0; i < joints.Length; i++)
+        {
+            joints[i] = new Joint(_currentJoints[i * 2], _currentJoints[i * 2 + 1]);
+        }
+        _animator.SetJoints(joints);
+        _animator.Render(_meshBuffer, _meshSize, _meshSize);
+        Premultiply(_meshBuffer);
+        _meshBitmap.WritePixels(new Int32Rect(0, 0, _meshSize, _meshSize), _meshBuffer, _meshSize * 4, 0);
+    }
+
+    private Joint[] ActionPose(string action, double t)
+    {
+        Joint[] p = (Joint[])_restJoints.Clone();
+        switch (action)
+        {
+            case "fly":
+                p[2] = new Joint(0.50, 0.20);
+                p[3] = new Joint(0.28, 0.40);
+                p[4] = new Joint(0.14, 0.24);
+                p[5] = new Joint(0.06, 0.16);
+                p[6] = new Joint(0.72, 0.40);
+                p[7] = new Joint(0.86, 0.24);
+                p[8] = new Joint(0.94, 0.16);
+                p[9] = new Joint(0.38, 0.86);
+                p[10] = new Joint(0.30, 0.96);
+                p[11] = new Joint(0.24, 1.04);
+                p[12] = new Joint(0.62, 0.86);
+                p[13] = new Joint(0.70, 0.96);
+                p[14] = new Joint(0.76, 1.04);
+                break;
+            case "wave":
+                p[6] = new Joint(0.62, 0.38);
+                p[7] = new Joint(0.72, 0.20);
+                p[8] = new Joint(0.78, 0.12);
+                break;
+            case "run":
+                double swing = Math.Sin(t * 8.0);
+                p[3] = new Joint(0.30, 0.52);
+                p[4] = new Joint(0.16, 0.66);
+                p[5] = new Joint(0.08, 0.74);
+                p[6] = new Joint(0.70, 0.52);
+                p[7] = new Joint(0.84, 0.66);
+                p[8] = new Joint(0.92, 0.74);
+                p[9] = new Joint(0.40 + 0.04 * swing, 0.82);
+                p[10] = new Joint(0.34 + 0.06 * swing, 0.93);
+                p[11] = new Joint(0.28 + 0.08 * swing, 1.01);
+                p[12] = new Joint(0.60 - 0.04 * swing, 0.82);
+                p[13] = new Joint(0.66 - 0.06 * swing, 0.93);
+                p[14] = new Joint(0.72 - 0.08 * swing, 1.01);
+                break;
+            case "test":
+                p[2] = new Joint(0.46, 0.24);
+                p[3] = new Joint(0.40, 0.54);
+                p[4] = new Joint(0.30, 0.58);
+                p[5] = new Joint(0.18, 0.62);
+                break;
+            case "dance":
+                double s = Math.Sin(t * 5.0);
+                p[3] = new Joint(0.30, 0.46 - 0.04 * s);
+                p[4] = new Joint(0.16, 0.34 - 0.08 * s);
+                p[5] = new Joint(0.10, 0.22 - 0.10 * s);
+                p[6] = new Joint(0.70, 0.46 + 0.04 * s);
+                p[7] = new Joint(0.84, 0.34 + 0.08 * s);
+                p[8] = new Joint(0.90, 0.22 + 0.10 * s);
+                break;
+            case "squat":
+                p[2] = new Joint(0.50, 0.34);
+                p[9] = new Joint(0.36, 0.82);
+                p[10] = new Joint(0.26, 0.94);
+                p[11] = new Joint(0.18, 1.02);
+                p[12] = new Joint(0.64, 0.82);
+                p[13] = new Joint(0.74, 0.94);
+                p[14] = new Joint(0.82, 1.02);
+                break;
+        }
+        return p;
+    }
+
+    private static double[] FlattenJoints(Joint[] joints)
+    {
+        double[] flat = new double[joints.Length * 2];
+        for (int i = 0; i < joints.Length; i++)
+        {
+            flat[i * 2] = joints[i].U;
+            flat[i * 2 + 1] = joints[i].V;
+        }
+        return flat;
     }
 
     private void ShowPanel()
@@ -407,8 +540,17 @@ public class PetWindow : Window
 
     internal void SetTopmost(bool topmost)
     {
-        Topmost = topmost;
         _settings.Topmost = topmost;
+        Topmost = topmost;
+        ApplyLayer(topmost);
+    }
+
+    private void ApplyLayer(bool topmost)
+    {
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) return;
+        IntPtr insertAfter = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
+        SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     }
 
     private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -435,6 +577,29 @@ public class PetWindow : Window
         bmp.Freeze();
         stream.Dispose();
         return bmp;
+    }
+
+    private static System.Drawing.Bitmap BitmapFromBitmapImage(BitmapImage image)
+    {
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(image));
+        using (var ms = new MemoryStream())
+        {
+            encoder.Save(ms);
+            ms.Position = 0;
+            return new System.Drawing.Bitmap(ms);
+        }
+    }
+
+    private static void Premultiply(byte[] buffer)
+    {
+        for (int i = 0; i < buffer.Length; i += 4)
+        {
+            byte a = buffer[i + 3];
+            buffer[i] = (byte)(buffer[i] * a / 255);
+            buffer[i + 1] = (byte)(buffer[i + 1] * a / 255);
+            buffer[i + 2] = (byte)(buffer[i + 2] * a / 255);
+        }
     }
 
     private static double Clamp(double v, double min, double max)
