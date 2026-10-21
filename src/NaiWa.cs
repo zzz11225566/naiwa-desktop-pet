@@ -169,6 +169,7 @@ public class PetWindow : Window
     private double _actionDuration;
     private bool _actionActive;
     private bool _rendering;
+    private DateTime _lastRender;
 
     private DateTime _downTime;
     private Point _downPoint;
@@ -388,6 +389,10 @@ public class PetWindow : Window
 
     private void OnRendering(object sender, EventArgs e)
     {
+        DateTime now = DateTime.UtcNow;
+        double dt = Math.Min(0.05, (now - _lastRender).TotalSeconds);
+        _lastRender = now;
+        if (dt <= 0) dt = 0.016;
         double elapsed = (DateTime.UtcNow - _actionStart).TotalSeconds;
         Joint[] targetJoints;
         if (_actionActive && elapsed < _actionDuration)
@@ -415,9 +420,10 @@ public class PetWindow : Window
         }
 
         double[] targetFlat = FlattenJoints(targetJoints);
+        double damp = 1.0 - Math.Exp(-dt * 7.0);
         for (int i = 0; i < _currentJoints.Length; i++)
         {
-            _currentJoints[i] += (targetFlat[i] - _currentJoints[i]) * 0.24;
+            _currentJoints[i] += (targetFlat[i] - _currentJoints[i]) * damp;
         }
 
         Joint[] joints = new Joint[_restJoints.Length];
